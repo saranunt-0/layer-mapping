@@ -14,6 +14,7 @@ dependencies = [
     "opencv-python-headless",
     "pillow",
     "scikit-image",
+    "scipy",
     "torch>=2.1",
     "transformers>=4.45",
 ]

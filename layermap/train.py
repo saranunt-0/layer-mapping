@@ -1,8 +1,11 @@
-"""Fine-tune Depth Anything V2 Small to predict paint-order layer indices.
+"""Fine-tune Depth Anything V2 Small to predict paint-order layer indices (and optionally more targets).
 
 Usable from a notebook (`train(TrainConfig(...))`) or the command line:
 
     python -m layermap.train --train-dirs data/synth_train --val-dir data/synth_val --steps 2000
+
+With `targets=["hybrid", "layer"]` one network predicts layered continuous depth and the layer index
+as two output channels (data generated with `with_depth=True`).
 
 Checkpoints go to <out_dir>/last (every save_every steps, for resuming after a
 Colab disconnect) and <out_dir>/best (highest validation score).
@@ -50,27 +53,48 @@ class TrainConfig:
     resume: bool = True
     seed: int = 0
     loss: LossWeights = field(default_factory=LossWeights)
+    # Output channels, in order; see layermap.data.TARGETS. The first one picks the best checkpoint.
+    targets: list[str] = field(default_factory=lambda: ["layer"])
+    target_weights: list[float] | None = None
+    margin: float = 0.02  # layer separation used by the "hybrid" target
 
 
 @torch.no_grad()
 def evaluate(model, dataset, batch_size: int = 8, max_items: int | None = None) -> dict:
     """Mean metrics (see layermap.metrics) over an eval-mode LayerFolderDataset.
 
-    `score` is the mean of the three pair accuracies and picks the best checkpoint.
+    `score` is the mean of the three pair accuracies (of the first target) and picks the best checkpoint.
+    With several targets each metric is reported per target as "<target>/<metric>". Each target is scored
+    on the model channel trained for it; a model without that channel (e.g. zero-shot) uses its last one.
     """
     model.eval()
     device = next(model.parameters()).device
+    targets = getattr(dataset, "targets", ("layer",))
+    trained_for = list(getattr(model.config, "layermap_targets", None) or [])
     n = len(dataset) if max_items is None else min(max_items, len(dataset))
     rows = []
     for start in range(0, n, batch_size):
         items = [dataset[i] for i in range(start, min(n, start + batch_size))]
         x = torch.stack([it[0] for it in items]).to(device)
         with torch.autocast(device.type, dtype=_amp_dtype(device), enabled=device.type == "cuda"):
-            pred = model(pixel_values=x).predicted_depth.float().cpu()
-        rows += [all_metrics(p, t) for p, (_, t) in zip(pred, items)]
+            pred = _channels(model(pixel_values=x).predicted_depth).float().cpu()
+        for p, (_, t) in zip(pred, items):
+            t = t[None] if t.dim() == 2 else t
+            row = {}
+            for c, name in enumerate(targets):
+                ch = trained_for.index(name) if name in trained_for[: p.shape[0]] else min(c, p.shape[0] - 1)
+                prefix = "" if len(targets) == 1 else f"{name}/"
+                row.update({prefix + k: v for k, v in all_metrics(p[ch], t[c]).items()})
+            rows.append(row)
     out = {k: float(np.nanmean([r[k] for r in rows])) for k in rows[0]}
-    out["score"] = float(np.mean([out[f"acc_{m}"] for m in PAIR_MODES]))
+    prefix = "" if len(targets) == 1 else f"{targets[0]}/"
+    out["score"] = float(np.mean([out[f"{prefix}acc_{m}"] for m in PAIR_MODES]))
     return out
+
+
+def _channels(pred: torch.Tensor) -> torch.Tensor:
+    """Model output as (B, C, H, W) whether the head has one channel or several."""
+    return pred[:, None] if pred.dim() == 3 else pred
 
 
 def _amp_dtype(device: torch.device) -> torch.dtype:
@@ -90,15 +114,29 @@ def train(cfg: TrainConfig) -> list[dict]:
     torch.manual_seed(cfg.seed)
     out = Path(cfg.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "config.json").write_text(json.dumps(dataclasses.asdict(cfg), indent=2))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     resume_dir = out / "last"
     resuming = cfg.resume and (resume_dir / "train_state.pt").exists()
-    model = load_model(str(resume_dir) if resuming else cfg.backbone, for_training=True, device=device)
+    if resuming:
+        from transformers import AutoConfig
 
-    train_ds = ConcatDataset([LayerFolderDataset(d, cfg.size, train=True) for d in cfg.train_dirs])
-    val_ds = LayerFolderDataset(cfg.val_dir, cfg.size, train=False, max_items=cfg.val_items) if cfg.val_dir else None
+        prev = list(getattr(AutoConfig.from_pretrained(str(resume_dir)), "layermap_targets", None) or ["layer"])
+        if prev != list(cfg.targets):
+            raise ValueError(f"{resume_dir} was trained with targets {prev}, not {list(cfg.targets)}: "
+                             "use a new out_dir (or resume=False to start over in this one)")
+    (out / "config.json").write_text(json.dumps(dataclasses.asdict(cfg), indent=2))
+    model = load_model(str(resume_dir) if resuming else cfg.backbone, for_training=True, device=device,
+                       out_channels=len(cfg.targets))
+    model.config.layermap_targets = list(cfg.targets)
+    weights = torch.tensor(cfg.target_weights or [1.0] * len(cfg.targets), device=device)
+    if len(weights) != len(cfg.targets):
+        raise ValueError("target_weights needs one weight per target")
+
+    ds_kw = {"targets": cfg.targets, "margin": cfg.margin}
+    train_ds = ConcatDataset([LayerFolderDataset(d, cfg.size, train=True, **ds_kw) for d in cfg.train_dirs])
+    val_ds = (LayerFolderDataset(cfg.val_dir, cfg.size, train=False, max_items=cfg.val_items, **ds_kw)
+              if cfg.val_dir else None)
     loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, drop_last=True,
                         num_workers=cfg.num_workers, pin_memory=device.type == "cuda",
                         persistent_workers=cfg.num_workers > 0)
@@ -145,8 +183,14 @@ def train(cfg: TrainConfig) -> list[dict]:
                 break
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             with torch.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-                pred = model(pixel_values=x).predicted_depth
-            loss, terms = layer_loss(pred, y, cfg.loss)
+                pred = _channels(model(pixel_values=x).predicted_depth)
+            y = y[:, None] if y.dim() == 3 else y
+            loss, terms = 0.0, {}
+            for c, name in enumerate(cfg.targets):
+                lc, tc = layer_loss(pred[:, c], y[:, c], cfg.loss)
+                loss = loss + weights[c] * lc
+                for k, v in tc.items():
+                    terms[k] = terms.get(k, 0.0) + v / len(cfg.targets)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -182,8 +226,10 @@ def train(cfg: TrainConfig) -> list[dict]:
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--train-dirs", nargs="+", required=True)
+    p.add_argument("--targets", nargs="+", default=["layer"])
+    p.add_argument("--target-weights", nargs="+", type=float, default=None)
     for f in dataclasses.fields(TrainConfig):
-        if f.name in ("train_dirs", "loss"):
+        if f.name in ("train_dirs", "loss", "targets", "target_weights"):
             continue
         typ = {"int": int, "float": float, "bool": lambda s: s.lower() in ("1", "true", "yes")}.get(
             f.type if isinstance(f.type, str) else f.type.__name__, str)

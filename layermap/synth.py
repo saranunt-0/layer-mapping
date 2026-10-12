@@ -6,6 +6,14 @@ foreground, flowers. Every brush stroke also writes its layer number into an
 ID buffer, so the label at a pixel is the index of the last layer painted
 there (0 = painted first = furthest back).
 
+Each layer also carries simple scene geometry, so `render(..., return_depth=True)`
+returns a continuous disparity map (0 = sky at infinity, 1 = bottom of a flat
+ground plane): plains and roads recede smoothly, hills rise steeper than the
+plane behind their ridge, and trees, houses and figures stand at the depth of
+their base. Paint order and physical depth therefore agree at most boundaries
+but not everywhere (a tree in the middle distance is painted over a meadow
+that extends in front of it), just as in real paintings.
+
 Everything is generated from scratch, so the data carries no third-party
 license or copyright.
 """
@@ -19,7 +27,7 @@ import numpy as np
 
 
 # Bump when the generator's output changes, so cached datasets are not reused by mistake.
-GENERATOR_VERSION = 1
+GENERATOR_VERSION = 2
 # Minimum RGB distance (0..sqrt(3)) between a layer's colour and the layer painted before it.
 MIN_LAYER_CONTRAST = 0.12
 
@@ -48,6 +56,7 @@ class Layer:
     bottom_hsv: np.ndarray  # colour at the bottom of the layer's extent
     angle: float  # main stroke direction, degrees
     angle_jitter: float
+    depth: np.ndarray  # float32 (H, W) disparity of this layer's surface, defined everywhere
 
 
 # --------------------------------------------------------------------------- #
@@ -158,6 +167,61 @@ def _dab_mask(rng, h, w, y0, density):
     return m.astype(bool)
 
 
+def _road_mask(rng, h, w, y_v):
+    """A road running from the bottom edge to a vanishing point at row y_v, with a gentle bend."""
+    m = np.zeros((h, w), np.uint8)
+    ys = np.linspace(y_v, h + 2, 48)
+    t = (ys - y_v) / max(1.0, h - y_v)
+    vx = rng.uniform(0.3, 0.7) * w
+    bottom_x = vx + rng.uniform(-0.3, 0.3) * w
+    centre = vx + (bottom_x - vx) * t + rng.uniform(-0.12, 0.12) * w * np.sin(np.pi * t)
+    half = rng.uniform(0.12, 0.3) * w * t + 1
+    pts = np.concatenate([np.stack([centre - half, ys], 1), np.stack([centre + half, ys], 1)[::-1]])
+    cv2.fillPoly(m, [pts.round().astype(np.int32)], 1)
+    return m.astype(bool)
+
+
+# --------------------------------------------------------------------------- #
+# Geometry (disparity: larger = closer, 0 = infinitely far)
+# --------------------------------------------------------------------------- #
+
+
+def _ground_curve(h: int, horizon: float) -> np.ndarray:
+    """Disparity of a flat ground plane for each image row: 0.02 at the horizon, 1 at the bottom row."""
+    y = np.arange(h, dtype=np.float32)
+    below = np.clip((y - horizon) / max(1.0, h - horizon), 0, 1)
+    above = np.clip((horizon - y) / max(1.0, horizon), 0, 1)
+    return (0.02 + 0.98 * below - 0.01 * above).astype(np.float32)
+
+
+def _terrain_depth(ground: np.ndarray, ridge: np.ndarray, slope: float) -> np.ndarray:
+    """Terrain whose top edge is `ridge`: it starts at the ground-plane disparity of the ridge and grows
+    `slope` times as fast as the plane below it (1 = flat plain, < 1 = hill rising toward the ridge)."""
+    g_ridge = np.interp(np.clip(ridge, 0, len(ground) - 1), np.arange(len(ground)), ground)[None, :]
+    return (g_ridge + slope * (ground[:, None] - g_ridge)).astype(np.float32)
+
+
+def _object_depth(parts: list[tuple[np.ndarray, float]], h: int, w: int) -> np.ndarray:
+    """Constant disparity per object, extended to nearby pixels so stroke spill inherits it."""
+    d = np.full((h, w), np.nan, np.float32)
+    for mask, value in parts:
+        d[mask] = value
+    holes = np.isnan(d)
+    if holes.all():
+        return np.zeros((h, w), np.float32)
+    if holes.any():
+        from scipy import ndimage
+
+        idx = ndimage.distance_transform_edt(holes, return_distances=False, return_indices=True)
+        d = d[tuple(idx)]
+    return d
+
+
+def _depth_at(depth: np.ndarray, x: float, y: float) -> float:
+    h, w = depth.shape
+    return float(depth[int(np.clip(y, 0, h - 1)), int(np.clip(x, 0, w - 1))])
+
+
 # --------------------------------------------------------------------------- #
 # Colour
 # --------------------------------------------------------------------------- #
@@ -202,7 +266,7 @@ def _compose(rng: np.random.Generator, h: int, w: int) -> list[Layer]:
         horizon_c = _hsv(zenith[0], zenith[1] * 0.5, min(1.0, zenith[2] + 0.1))
     warm = mood == "sunset"
 
-    def add(mask, kind, top, bottom, angle, jitter):
+    def add(mask, kind, top, bottom, angle, jitter, depth):
         if not mask.any():
             return
         if layers:
@@ -213,16 +277,22 @@ def _compose(rng: np.random.Generator, h: int, w: int) -> list[Layer]:
                 shift = -0.18 if top[2] > 0.35 else 0.18
                 top = _hsv(top[0], top[1], top[2] + shift)
                 bottom = _hsv(bottom[0], bottom[1], bottom[2] + shift)
-        layers.append(Layer(mask, kind, top, bottom, angle, jitter))
+        depth = np.broadcast_to(np.asarray(depth, np.float32), (h, w))
+        layers.append(Layer(mask, kind, top, bottom, angle, jitter, depth))
 
     horizon = rng.uniform(0.3, 0.65) * h
-    add(np.ones((h, w), bool), "sky", zenith, horizon_c, 0.0, 15.0)
+    ground = _ground_curve(h, horizon)
+    plane = np.repeat(ground[:, None], w, axis=1)
+    # "Open plain" scenes: no mid-ground hills, flat foreground reaching (almost) to the horizon.
+    open_plain = rng.random() < 0.25
+    add(np.ones((h, w), bool), "sky", zenith, horizon_c, 0.0, 15.0, 0.0)
 
     if mood != "overcast" or rng.random() < 0.5:
         for _ in range(rng.integers(0, 3)):
             c = _hsv(rng.uniform(20, 60) if warm else rng.uniform(200, 260), rng.uniform(0.02, 0.25),
                      rng.uniform(0.85, 1.0))
-            add(_cloud_mask(rng, h, w, horizon), "cloud", c, _hsv(c[0], c[1] + 0.1, c[2] - 0.15), 0.0, 30.0)
+            add(_cloud_mask(rng, h, w, horizon), "cloud", c, _hsv(c[0], c[1] + 0.1, c[2] - 0.15), 0.0, 30.0,
+                0.001)
 
     # Distant ranges: each one a separate layer, hazier the further back.
     n_far = rng.integers(0, 3)
@@ -233,75 +303,95 @@ def _compose(rng: np.random.Generator, h: int, w: int) -> list[Layer]:
         base = _hsv(rng.uniform(200, 260) if rng.random() < 0.6 else rng.uniform(80, 150),
                     rng.uniform(0.2, 0.5), rng.uniform(0.35, 0.7))
         c = _haze(base, horizon_c, 0.35 + 0.4 * dist)
-        add(_below(y, h), "mountain", c, _hsv(c[0], c[1], c[2] - 0.08), rng.uniform(-30, 30), 25.0)
+        add(_below(y, h), "mountain", c, _hsv(c[0], c[1], c[2] - 0.08), rng.uniform(-30, 30), 25.0,
+            0.002 + 0.006 * (i + 1) / (n_far + 1))
 
     has_water = rng.random() < 0.45
     if has_water:
         y = _ridge(rng, w, horizon + rng.uniform(0.0, 0.05) * h, 0.004 * h, octaves=2)
         c = _hsv(horizon_c[0] + rng.uniform(-10, 10), horizon_c[1] + 0.1, horizon_c[2] - 0.1)
-        add(_below(y, h), "water", c, _hsv(zenith[0], zenith[1] + 0.1, zenith[2] - 0.25), 0.0, 5.0)
+        add(_below(y, h), "water", c, _hsv(zenith[0], zenith[1] + 0.1, zenith[2] - 0.25), 0.0, 5.0, plane)
         if rng.random() < 0.5:
-            m = np.zeros((h, w), bool)
+            parts = []
             for _ in range(rng.integers(1, 4)):
-                m |= _boat_mask(h, w, rng.uniform(0, w), horizon + rng.uniform(0.04, 0.15) * h,
-                                rng.uniform(0.03, 0.08) * h)
+                base_y = horizon + rng.uniform(0.04, 0.15) * h
+                bm = _boat_mask(h, w, rng.uniform(0, w), base_y, rng.uniform(0.03, 0.08) * h)
+                parts.append((bm, ground[int(min(base_y, h - 1))]))
+            m = np.any([p[0] for p in parts], axis=0)
             c = _hsv(rng.uniform(0, 360), rng.uniform(0.2, 0.7), rng.uniform(0.3, 0.95))
-            add(m, "boat", c, _hsv(c[0], c[1], c[2] - 0.2), 90.0, 40.0)
+            add(m, "boat", c, _hsv(c[0], c[1], c[2] - 0.2), 90.0, 40.0, _object_depth(parts, h, w))
 
     # Mid ground: fields/hills, optionally with a row of trees or houses on top.
     ground_top = horizon + (rng.uniform(0.12, 0.25) * h if has_water else rng.uniform(-0.02, 0.08) * h)
-    n_mid = rng.integers(1, 3)
+    n_mid = 0 if open_plain else rng.integers(1, 3)
     for i in range(n_mid):
         t = (i + 1) / (n_mid + 1)
         y_mean = ground_top + t * (h - ground_top) * 0.4
         y = _ridge(rng, w, y_mean, rng.uniform(0.01, 0.05) * h, slope=rng.normal(0, 0.08))
+        field_depth = _terrain_depth(ground, y, 1.0 if rng.random() < 0.4 else rng.uniform(0.4, 0.85))
         g = _hsv(rng.uniform(55, 140), rng.uniform(0.3, 0.7), rng.uniform(0.4, 0.8))
         g = _haze(g, horizon_c, 0.25 * (1 - t))
         add(_below(y, h), "field", g, _hsv(g[0] + rng.uniform(-15, 15), g[1], g[2] - 0.1),
-            rng.choice([0.0, 90.0]), 25.0)
+            rng.choice([0.0, 90.0]), 25.0, field_depth)
         if rng.random() < 0.6:
             scale = (y_mean / h) * rng.uniform(0.08, 0.2) * h
-            m = np.zeros((h, w), bool)
+            parts = []
             kind = rng.choice(["tree", "house"], p=[0.75, 0.25])
             style = rng.choice(["round", "poplar", "pine"])
             for x in rng.uniform(0, w, rng.integers(1, 7)):
                 base_y = float(np.interp(x, np.arange(w), y)) + scale * 0.1
-                if kind == "tree":
-                    m |= _tree_mask(rng, h, w, x, base_y, scale, style)
-                else:
-                    m |= _house_mask(h, w, x, base_y, scale, rng)
+                om = _tree_mask(rng, h, w, x, base_y, scale, style) if kind == "tree" else \
+                    _house_mask(h, w, x, base_y, scale, rng)
+                parts.append((om, _depth_at(field_depth, x, base_y)))
+            m = np.any([p[0] for p in parts], axis=0)
+            od = _object_depth(parts, h, w)
             if kind == "tree":
                 c = _hsv(rng.uniform(70, 160), rng.uniform(0.35, 0.8), rng.uniform(0.2, 0.55))
-                add(m, "tree", _hsv(c[0] - 15, c[1], c[2] + 0.2), c, rng.uniform(0, 180), 90.0)
+                add(m, "tree", _hsv(c[0] - 15, c[1], c[2] + 0.2), c, rng.uniform(0, 180), 90.0, od)
             else:
                 c = _hsv(rng.uniform(20, 50), rng.uniform(0.1, 0.5), rng.uniform(0.7, 0.95))
-                add(m, "house", _hsv(rng.uniform(0, 20), 0.6, 0.6), c, 90.0, 10.0)
+                add(m, "house", _hsv(rng.uniform(0, 20), 0.6, 0.6), c, 90.0, 10.0, od)
 
     # Foreground ground, then objects standing on it, then flowers.
-    y_fg = _ridge(rng, w, ground_top + (h - ground_top) * rng.uniform(0.5, 0.75), rng.uniform(0.02, 0.06) * h,
-                  slope=rng.normal(0, 0.12))
+    if open_plain:
+        y_fg = _ridge(rng, w, horizon + rng.uniform(0.0, 0.05) * h, 0.005 * h, octaves=3)
+        fg_depth = _terrain_depth(ground, y_fg, 1.0)
+    else:
+        y_fg = _ridge(rng, w, ground_top + (h - ground_top) * rng.uniform(0.5, 0.75), rng.uniform(0.02, 0.06) * h,
+                      slope=rng.normal(0, 0.12))
+        fg_depth = _terrain_depth(ground, y_fg, 1.0 if rng.random() < 0.4 else rng.uniform(0.4, 0.85))
+    fg_mask = _below(y_fg, h)
     g = _hsv(rng.uniform(40, 130), rng.uniform(0.4, 0.8), rng.uniform(0.35, 0.75))
-    add(_below(y_fg, h), "ground", g, _hsv(g[0] + rng.uniform(-20, 20), g[1], g[2] - 0.15), 90.0, 30.0)
+    add(fg_mask, "ground", g, _hsv(g[0] + rng.uniform(-20, 20), g[1], g[2] - 0.15), 90.0, 30.0, fg_depth)
+    # A road receding over the foreground to its crest (or to the horizon on an open plain).
+    road = np.zeros((h, w), bool)
+    if rng.random() < (0.7 if open_plain else 0.35):
+        road = _road_mask(rng, h, w, float(np.min(y_fg)) + 0.01 * h) & fg_mask
+        c = _hsv(rng.uniform(25, 45), rng.uniform(0.15, 0.45), rng.uniform(0.6, 0.9))
+        add(road, "road", _haze(c, horizon_c, 0.3), c, 90.0, 20.0, fg_depth + 0.001)
     # Tall foreground objects overlap everything behind them; they are the main source of
     # "upper pixel in front" pairs that the vertical prior gets wrong.
     if rng.random() < 0.65:
-        m = np.zeros((h, w), bool)
+        parts = []
         kind = rng.choice(["tree", "figure"], p=[0.6, 0.4])
         for x in rng.uniform(0, w, rng.integers(1, 3 if kind == "tree" else 5)):
             base_y = float(np.interp(x, np.arange(w), y_fg)) + rng.uniform(0.02, 0.1) * h
             if kind == "tree":
-                m |= _tree_mask(rng, h, w, x, base_y, rng.uniform(0.25, 0.5) * h,
+                om = _tree_mask(rng, h, w, x, base_y, rng.uniform(0.25, 0.5) * h,
                                 rng.choice(["round", "poplar", "pine"]))
             else:
-                m |= _figure_mask(h, w, x, base_y, rng.uniform(0.1, 0.25) * h)
+                om = _figure_mask(h, w, x, base_y, rng.uniform(0.1, 0.25) * h)
+            parts.append((om, _depth_at(fg_depth, x, base_y)))
+        m = np.any([p[0] for p in parts], axis=0)
         c = _hsv(rng.uniform(0, 360) if kind == "figure" else rng.uniform(70, 160), rng.uniform(0.3, 0.8),
                  rng.uniform(0.2, 0.6))
-        add(m, kind, _hsv(c[0], c[1], c[2] + 0.15), c, 90.0 if kind == "figure" else rng.uniform(0, 180), 60.0)
+        add(m, kind, _hsv(c[0], c[1], c[2] + 0.15), c, 90.0 if kind == "figure" else rng.uniform(0, 180), 60.0,
+            _object_depth(parts, h, w))
     if rng.random() < 0.5:
         c = _hsv(rng.choice([0, 45, 280, 330, 55]) + rng.uniform(-10, 10), rng.uniform(0.6, 1.0),
                  rng.uniform(0.75, 1.0))
         y0 = int(np.clip(np.median(y_fg), 0, h - 2))
-        add(_dab_mask(rng, h, w, y0, rng.uniform(0.5, 3.0)), "flowers", c, c, 0.0, 180.0)
+        add(_dab_mask(rng, h, w, y0, rng.uniform(0.5, 3.0)) & ~road, "flowers", c, c, 0.0, 180.0, fg_depth + 0.002)
 
     return layers
 
@@ -386,12 +476,14 @@ def _canvas_finish(rng, img8: np.ndarray, cfg: SynthConfig, flat: bool) -> np.nd
     return cv2.imdecode(buf, cv2.IMREAD_COLOR)[..., ::-1].copy() if ok else out8
 
 
-def render(seed: int, cfg: SynthConfig | None = None) -> tuple[np.ndarray, np.ndarray]:
+def render(seed: int, cfg: SynthConfig | None = None, return_depth: bool = False):
     """Render one scene.
 
     Returns:
         rgb: uint8 (H, W, 3).
         labels: uint8 (H, W) dense layer index, 0 = back (painted first).
+        depth (only with return_depth): float32 (H, W) disparity of the visible surface,
+            0 = infinitely far, 1 = bottom row of a flat ground plane.
     """
     cfg = cfg or SynthConfig()
     rng = np.random.default_rng(seed)
@@ -407,4 +499,17 @@ def render(seed: int, cfg: SynthConfig | None = None) -> tuple[np.ndarray, np.nd
 
     rgb = _canvas_finish(rng, img, cfg, flat)
     _, labels = np.unique(ids, return_inverse=True)
-    return rgb, labels.reshape(h, w).astype(np.uint8)
+    labels = labels.reshape(h, w).astype(np.uint8)
+    if not return_depth:
+        return rgb, labels
+    depth = np.zeros((h, w), np.float32)
+    for k, layer in enumerate(layers):
+        sel = ids == k
+        depth[sel] = layer.depth[sel]
+    return rgb, labels, depth
+
+
+def scene_kinds(seed: int, cfg: SynthConfig | None = None) -> list[str]:
+    """Kinds of the layers `render(seed, cfg)` paints, back to front (e.g. to pick scenes with a road)."""
+    cfg = cfg or SynthConfig()
+    return [layer.kind for layer in _compose(np.random.default_rng(seed), cfg.size, cfg.size)]

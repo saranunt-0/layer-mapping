@@ -142,6 +142,9 @@ Notes:
 4. **Phase 3:** product features. Fill occluded regions (inpainting) for parallax, PSD export, tiled
    high-resolution inference.
 
+Side track (October 2026): **hybrid depth**, i.e. layers plus smooth depth inside each layer, for roads and plains.
+Both a two-model fusion and a single two-channel model are in [`HYBRID.md`](HYBRID.md) and notebook 03.
+
 ## 8. Verified vs estimated
 
 * **Verified:**
