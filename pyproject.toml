@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "layermap"
+version = "0.1.0"
+description = "Paint-order layer maps for landscape and Impressionist paintings, trained only on openly licensed data"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "opencv-python-headless",
+    "pillow",
+    "scikit-image",
+    "torch>=2.1",
+    "transformers>=4.45",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools]
+packages = ["layermap"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
