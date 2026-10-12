@@ -21,8 +21,12 @@ on a GPU, with the real Illustrator's Depth model added.*
 * **Re-predicting depth with occluders masked out did not pay off.** With exact layers it slightly improves hard-pair
   ordering, but continuity inside layers gets worse (0.67 vs 0.68 on the same scenes). With imperfect layers,
   boundary accuracy drops from 0.79 to 0.72. The filled regions read as flat paint to the depth model.
-* **A single model** (Depth Anything V2 Small with a 2-channel head: hybrid depth + layer index) trained on synthetic
-  scenes with exact ground truth: see Part 2 for the measured result and its caveats.
+* **A single model can do both.** It is Depth Anything V2 Small with a two-channel head (hybrid depth + layer index),
+  trained only on synthetic scenes with exact ground truth for 900 CPU steps. On held-out synthetic scenes it beats
+  every fusion on continuity inside layers: 0.80 vs ≤ 0.71, and 0.74 vs 0.63 on road scenes. It also beats fusion
+  with imperfect layers on boundary order (0.86 vs ~0.79). Only fusion with *exact* layers orders boundaries better
+  (0.99). Caveat: it was tested on scenes from the same generator it was trained on, so real paintings are the open
+  question.
 
 ## 1. What "hybrid depth" should mean
 
@@ -122,7 +126,38 @@ Masked re-prediction, measured on the first 20 scenes and compared with the same
 * **Training:** `TrainConfig(targets=["hybrid", "layer"])`, from notebook 03 or 02, or
   `python -m layermap.train --targets hybrid layer ...`.
 
-*Results: pending (training in progress).*
+### Result: 900 training steps on CPU (322 px crops, batch 4, 1,200 synthetic scenes)
+
+Same 40 held-out scenes as Part 1 (different seeds from training).
+
+| Method | acc_edge ↑ | rho_within ↑ | acc_hard ↑ | ssi_mae ↓ | rho_within, road scenes ↑ |
+|---|---|---|---|---|---|
+| Depth Anything only | 0.782 | 0.714 | 0.677 | 0.425 | 0.628 |
+| ordered fusion, exact layers (upper bound) | **0.992** | 0.713 | 0.818 | 0.401 | 0.626 |
+| stacked fusion, exact layers (upper bound) | 1.000 | 0.713 | **0.912** | 0.549 | 0.626 |
+| ordered fusion, noisy layers (realistic) | 0.797 | 0.700 | 0.770 | 0.402 | 0.618 |
+| **single model, hybrid channel** | 0.861 | **0.798** | 0.838 | **0.125** | **0.742** |
+| single model, layer channel | 0.906 | 0.480 | 0.905 | 0.520 | 0.489 |
+
+What this shows, and what it does not:
+
+* **Inside layers the single model is better than any fusion can be.** Fusions are capped by the depth model, but the
+  single model *learned* depth on painterly input. In the profile plot below, its curve follows the road's true slope
+  while both fusions inherit Depth Anything's flattened slope.
+* **At layer boundaries it sits between the realistic and the ideal fusion.** It reaches 0.86, against 0.79 with
+  imperfect layers and 0.99 with exact ones. More training, higher resolution or the layer-query decoder below should
+  close this.
+* **`ssi_mae` (0.125) is flattering.** The model was trained on exactly this target from the same generator. Read it
+  as "it learned the definition", not as accuracy on paintings.
+* **The layer channel** orders boundaries better than the hybrid channel (0.91), and quantised into a few layers it
+  gives editable layers without a second model.
+* **On real paintings (second figure) the changes from Depth Anything are modest.** Turner's seascapes look much the
+  same. In Hokusai's *Great Wave* the wave is pulled in front of the sky and Mount Fuji, as paint order says it should
+  be. In *Starry Night* the layer channel fragments the swirling sky. Real-painting quality is unmeasured until there
+  are labelled paintings.
+* **No control run yet.** One open question is how much of the continuity gain comes simply from adapting depth to
+  painterly images. Fine-tuning on true depth alone and then fusing would answer it. The notebook makes that a
+  one-line change (`targets=["depth"]`).
 
 ![synthetic examples](figures/hybrid_synthetic.jpg)
 
